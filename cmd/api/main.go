@@ -2,17 +2,42 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"database/sql"
+	"errors"
 	"os"
 	"os/signal"
 	"syscall"
 	"time"
 
+	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
+
+func registerTLS() error {
+	pem := os.Getenv("DB_CA_CERT")
+	if pem == "" {
+		if path := os.Getenv("DB_CA_CERT_FILE"); path != "" {
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			pem = string(b)
+		}
+	}
+	if pem == "" {
+		return nil
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM([]byte(pem)) {
+		return errors.New("invalid DB_CA_CERT")
+	}
+	return mysql.RegisterTLSConfig("custom", &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12})
+}
 
 func main() {
 	zerolog.TimeFieldFormat = time.RFC3339Nano
@@ -23,6 +48,10 @@ func main() {
 
 	dsn := mustEnv("DB_DSN")
 	port := getEnv("PORT", "8080")
+
+	if err := registerTLS(); err != nil {
+		log.Fatal().Err(err).Msg("failed to register TLS for mysql")
+	}
 
 	db, err := connectDB(dsn, 60*time.Second)
 	if err != nil {
