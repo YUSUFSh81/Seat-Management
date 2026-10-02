@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YUSUFSh81/Seat-Management/internal/auth"
 	"github.com/YUSUFSh81/Seat-Management/internal/store"
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
@@ -84,6 +85,16 @@ func main() {
 			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"status": "not_ready", "dependency": "db"})
 		}
 		return c.JSON(fiber.Map{"status": "ready"})
+	})
+
+	secret := []byte(mustEnv("JWT_SECRET"))
+
+	// temporary route to verify auth, delete later
+	app.Get("/whoami", auth.Middleware(secret), func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"user_id": auth.UserID(c), "role": c.Locals("role")})
+	})
+	app.Get("/admin-check", auth.Middleware(secret), auth.RequireAdmin(), func(c *fiber.Ctx) error {
+		return c.JSON(fiber.Map{"ok": true})
 	})
 
 	go func() {
