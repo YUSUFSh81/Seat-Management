@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/YUSUFSh81/Seat-Management/internal/store"
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofiber/fiber/v2"
@@ -57,6 +58,13 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("db connect failed")
 	}
+
+	mctx, mcancel := context.WithTimeout(context.Background(), 60*time.Second)
+	if err := store.Migrate(mctx, db); err != nil {
+		mcancel()
+		log.Fatal().Err(err).Msg("migration failed")
+	}
+	mcancel()
 	defer db.Close()
 	app := fiber.New(fiber.Config{
 		DisableStartupMessage: true,
