@@ -13,6 +13,7 @@ import (
 
 	"github.com/YUSUFSh81/Seat-Management/internal/auth"
 	"github.com/YUSUFSh81/Seat-Management/internal/store"
+	"github.com/YUSUFSh81/Seat-Management/internal/store/handlers"
 	"github.com/go-sql-driver/mysql"
 	_ "github.com/go-sql-driver/mysql"
 	"github.com/gofiber/fiber/v2"
@@ -90,12 +91,14 @@ func main() {
 	secret := []byte(mustEnv("JWT_SECRET"))
 
 	// temporary route to verify auth, delete later
-	app.Get("/whoami", auth.Middleware(secret), func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"user_id": auth.UserID(c), "role": c.Locals("role")})
-	})
-	app.Get("/admin-check", auth.Middleware(secret), auth.RequireAdmin(), func(c *fiber.Ctx) error {
-		return c.JSON(fiber.Map{"ok": true})
-	})
+	// app.Get("/whoami", auth.Middleware(secret), func(c *fiber.Ctx) error {
+	// 	return c.JSON(fiber.Map{"user_id": auth.UserID(c), "role": c.Locals("role")})
+	// })
+	// app.Get("/admin-check", auth.Middleware(secret), auth.RequireAdmin(), func(c *fiber.Ctx) error {
+	// 	return c.JSON(fiber.Map{"ok": true})
+	// })
+
+	app.Post("/shows", auth.Middleware(secret), auth.RequireAdmin(), handlers.CreateShow(db))
 
 	go func() {
 		log.Info().Str("port", port).Msg("listening")
