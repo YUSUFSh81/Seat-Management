@@ -1,0 +1,22 @@
+services:
+  db:
+    image: mysql:8.0
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: seats
+    ports:
+      - "3307:3306"   
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-proot"]
+      interval: 3s
+      retries: 20
+  api:
+    build: .
+    environment:
+      DB_DSN: root:root@tcp(db:3306)/seats?parseTime=true
+      PORT: "8080"
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
