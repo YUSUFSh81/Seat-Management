@@ -5,8 +5,49 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"math/rand/v2"
+	"slices"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 )
+
+// Starts n goroutines and releases them at the same instant.
+func fireAll(n int, fn func(i int)) {
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			fn(i)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+}
+
+// One GROUP BY statement = one consistent snapshot (three separate COUNTs can tear mid-burst).
+func seatCounts(db *sql.DB, showID int64) (map[string]int, error) {
+	out := map[string]int{}
+	rows, err := db.Query("Select status, COUNT(*) from show_seats where show_id=? GROUP BY status;", showID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var s string
+		var c int
+		rows.Scan(&s, &c)
+		out[s] = c
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 func mustReserve(t *testing.T, db *sql.DB, user string, showID int64, seats []string, key string, limit int) ReservationData {
 	t.Helper()
@@ -329,4 +370,304 @@ func TestLimitIsPerShow(t *testing.T) {
 	}
 	assertInvariant(t, db, show1)
 	assertInvariant(t, db, show2)
+}
+
+func TestReplay(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	showID := mkShow(t, db, 5, 4)
+
+	first, replayed, err := Reserve(ctx, db, "alice", showID, []string{"S1", "S2"}, "k1", 2000, 4)
+	if err != nil || replayed {
+		t.Fatalf("first call: err=%v replayed=%v", err, replayed)
+	}
+
+	second, replayed2, err := Reserve(ctx, db, "alice", showID, []string{"S1", "S2"}, "k1", 2000, 4)
+	if err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	if !replayed2 {
+		t.Fatal("retry must be flagged as a replay")
+	}
+	if second.ReservationID != first.ReservationID ||
+		second.AmountPaise != first.AmountPaise ||
+		!slices.Equal(second.Seats, first.Seats) {
+		t.Fatalf("replay returned a different reservation: first=%+v second=%+v", first, second)
+	}
+
+	// the retry moved nothing
+	if got := countReservations(t, db, "alice", "k1"); got != 1 {
+		t.Fatalf("reservation rows = %d, want 1", got)
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 2 {
+		t.Fatalf("seats_held = %d, want 2 (a retry must not count twice)", got)
+	}
+	if got := countAvailable(t, db, showID); got != 3 {
+		t.Fatalf("available = %d, want 3", got)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestReplayWithReorderedSeats(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	showID := mkShow(t, db, 5, 4)
+
+	first := mustReserve(t, db, "alice", showID, []string{"S1", "S2"}, "k1", 4)
+
+	second, replayed, err := Reserve(ctx, db, "alice", showID, []string{"S2", "S1"}, "k1", 2000, 4)
+	if err != nil {
+		t.Fatalf("same seats in another order must be a replay, got %v", err)
+	}
+	if !replayed || second.ReservationID != first.ReservationID {
+		t.Fatalf("replayed=%v ids %d vs %d", replayed, first.ReservationID, second.ReservationID)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestSameKeyDifferentSeats(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 5, 4)
+
+	mustReserve(t, db, "alice", showID, []string{"S1", "S2"}, "k1", 4)
+
+	_, replayed, err := Reserve(context.Background(), db, "alice", showID, []string{"S1", "S3"}, "k1", 2000, 4)
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+	if replayed {
+		t.Fatal("a conflict is not a replay")
+	}
+
+	if got := seatStatus(t, db, showID, "S3"); got != "available" {
+		t.Fatalf("S3 status = %q, want available", got)
+	}
+	if got := countReservations(t, db, "alice", "k1"); got != 1 {
+		t.Fatalf("reservation rows = %d, want 1", got)
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 2 {
+		t.Fatalf("seats_held = %d, want 2", got)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestSameKeyOnAnotherShow(t *testing.T) {
+	db := testDB(t)
+	show1 := mkShow(t, db, 5, 4)
+	show2 := mkShow(t, db, 5, 4)
+
+	mustReserve(t, db, "alice", show1, []string{"S1"}, "k1", 4)
+
+	// same user, same key, same seat labels, different show: the hash includes the show id
+	_, _, err := Reserve(context.Background(), db, "alice", show2, []string{"S1"}, "k1", 1000, 4)
+	if !errors.Is(err, ErrIdempotencyConflict) {
+		t.Fatalf("expected ErrIdempotencyConflict, got %v", err)
+	}
+	if got := seatStatus(t, db, show2, "S1"); got != "available" {
+		t.Fatalf("show2 S1 status = %q, want available", got)
+	}
+	assertInvariant(t, db, show2)
+}
+
+func TestKeyIsPerUser(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 5, 4)
+
+	a := mustReserve(t, db, "alice", showID, []string{"S1"}, "same-key", 4)
+	b := mustReserve(t, db, "bob", showID, []string{"S2"}, "same-key", 4) // bob's key is independent
+
+	if a.ReservationID == b.ReservationID {
+		t.Fatal("two users with the same key string must get separate reservations")
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestUnknownSeat(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 5, 4)
+
+	_, _, err := Reserve(context.Background(), db, "alice", showID, []string{"S1", "ZZ99"}, "k1", 2000, 4)
+	if !errors.Is(err, ErrSeatsUnavailable) {
+		t.Fatalf("expected ErrSeatsUnavailable, got %v", err)
+	}
+	if got := seatStatus(t, db, showID, "S1"); got != "available" {
+		t.Fatalf("S1 status = %q, want available (all-or-nothing)", got)
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 0 {
+		t.Fatalf("seats_held = %d, want 0", got)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestHotSeat(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 10, 4)
+
+	const n = 200
+	var ok, taken atomic.Int32
+	fireAll(n, func(i int) {
+		_, _, err := Reserve(context.Background(), db, fmt.Sprintf("u%d", i),
+			showID, []string{"S1"}, fmt.Sprintf("k%d", i), 1000, 4)
+		switch {
+		case err == nil:
+			ok.Add(1)
+		case errors.Is(err, ErrSeatsUnavailable):
+			taken.Add(1)
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if ok.Load() != 1 || taken.Load() != n-1 {
+		t.Fatalf("ok=%d taken=%d, want 1 and %d", ok.Load(), taken.Load(), n-1)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestSameKeyInParallel(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 5, 4)
+
+	const n = 20
+	ids := make([]int64, n) // each goroutine writes its own index, so no race
+	var fresh atomic.Int32
+	fireAll(n, func(i int) {
+		d, replayed, err := Reserve(context.Background(), db, "alice", showID,
+			[]string{"S1", "S2"}, "same-key", 2000, 4)
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+			return
+		}
+		ids[i] = d.ReservationID
+		if !replayed {
+			fresh.Add(1)
+		}
+	})
+
+	if fresh.Load() != 1 {
+		t.Fatalf("%d calls created a reservation, want exactly 1", fresh.Load())
+	}
+	for i, id := range ids {
+		if id == 0 || id != ids[0] {
+			t.Fatalf("call %d returned reservation %d, want %d", i, id, ids[0])
+		}
+	}
+	if got := countReservations(t, db, "alice", "same-key"); got != 1 {
+		t.Fatalf("reservation rows = %d, want 1", got)
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 2 {
+		t.Fatalf("seats_held = %d, want 2", got)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestLimitUnderConcurrency(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 20, 4)
+
+	const n = 10
+	var ok, over atomic.Int32
+	fireAll(n, func(i int) {
+		_, _, err := Reserve(context.Background(), db, "alice", showID,
+			[]string{fmt.Sprintf("S%d", i+1)}, fmt.Sprintf("k%d", i), 1000, 4)
+		switch {
+		case err == nil:
+			ok.Add(1)
+		case errors.Is(err, ErrOverLimit):
+			over.Add(1)
+		default:
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	if ok.Load() != 4 || over.Load() != n-4 {
+		t.Fatalf("ok=%d over=%d, want 4 and %d", ok.Load(), over.Load(), n-4)
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 4 {
+		t.Fatalf("seats_held = %d, want 4", got)
+	}
+	assertInvariant(t, db, showID) // confirmed seats == 4 == reservation seats
+}
+
+func TestStampede(t *testing.T) {
+	db := testDB(t)
+	const total, hot = 200, 20
+	showID := mkShow(t, db, total, 4)
+
+	// poll the invariant while the burst runs
+	stop := make(chan struct{})
+	var pollWG sync.WaitGroup
+	pollWG.Add(1)
+	go func() {
+		defer pollWG.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			c, err := seatCounts(db, showID)
+			if err != nil {
+				t.Errorf("poll failed: %v", err)
+				return
+			}
+			if sum := c["available"] + c["held"] + c["confirmed"]; sum != total {
+				t.Errorf("invariant broken mid-burst: %v", c)
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	const n = 2000
+	var created, replays, taken, over, other atomic.Int32
+	fireAll(n, func(i int) {
+		user := fmt.Sprintf("u%d", i%500) // users repeat, so the limit bites too
+		key := fmt.Sprintf("k%d", i)
+
+		// 1 to 3 distinct hot seats
+		cnt := 1 + rand.IntN(3)
+		seats := make([]string, 0, cnt)
+		for _, p := range rand.Perm(hot)[:cnt] {
+			seats = append(seats, fmt.Sprintf("S%d", p+1))
+		}
+
+		attempts := 1
+		if i%10 == 0 {
+			attempts = 2 // a retry with the same key
+		}
+		for a := 0; a < attempts; a++ {
+			_, replayed, err := Reserve(context.Background(), db, user, showID, seats, key, int64(len(seats))*1000, 4)
+			switch {
+			case err == nil && replayed:
+				replays.Add(1)
+			case err == nil:
+				created.Add(1)
+			case errors.Is(err, ErrSeatsUnavailable):
+				taken.Add(1)
+			case errors.Is(err, ErrOverLimit):
+				over.Add(1)
+			default:
+				other.Add(1)
+				t.Errorf("unexpected error: %v", err)
+			}
+		}
+	})
+	close(stop)
+	pollWG.Wait()
+
+	t.Logf("created=%d replays=%d seat_taken=%d over_limit=%d other=%d",
+		created.Load(), replays.Load(), taken.Load(), over.Load(), other.Load())
+
+	c, err := seatCounts(db, showID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c["confirmed"] > hot {
+		t.Fatalf("confirmed %d seats but only %d were contested", c["confirmed"], hot)
+	}
+	if c["confirmed"] == 0 {
+		t.Fatal("nobody won anything, something is wrong")
+	}
+	assertInvariant(t, db, showID)
 }

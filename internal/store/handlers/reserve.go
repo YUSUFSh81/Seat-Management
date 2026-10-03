@@ -3,6 +3,7 @@ package handlers
 import (
 	"database/sql"
 	"errors"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -11,6 +12,8 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog/log"
 )
+
+var seatRe = regexp.MustCompile(`^[A-Z0-9-]{1,16}$`)
 
 type ReserveSeatReq struct {
 	IdempotencyKey string   `json:"idempotency_key"`
@@ -34,7 +37,7 @@ func Reserve(db *sql.DB) fiber.Handler {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request"})
 		}
 		sId, err := strconv.ParseInt(showId, 10, 64)
-		if err != nil {
+		if err != nil || sId < 1 {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request"})
 		}
 		var req ReserveSeatReq
@@ -49,6 +52,12 @@ func Reserve(db *sql.DB) fiber.Handler {
 		}
 
 		// slices.Sort(req.Seats)
+		if h := c.Get("Idempotency-Key"); h != "" {
+			if req.IdempotencyKey != "" && req.IdempotencyKey != h {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "idempotency key in header and body differ"})
+			}
+			req.IdempotencyKey = h
+		}
 
 		if len(req.IdempotencyKey) < 1 || len(req.IdempotencyKey) > 128 {
 			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid idempotency key"})
@@ -63,8 +72,8 @@ func Reserve(db *sql.DB) fiber.Handler {
 			if seat == "" {
 				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "seat cannot be empty"})
 			}
-			if len(seat) > 16 || strings.ContainsAny(seat, " \t\r\n") {
-				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid seat label"})
+			if !seatRe.MatchString(seat) {
+				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid seat label", "seat": seat})
 			}
 			if _, ok := duplicateSeats[seat]; ok {
 				return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "duplicate seats provided"})
