@@ -23,12 +23,13 @@ type ReserveSeatReq struct {
 }
 
 type ReserveSeatRes struct {
-	ReservationID int64    `json:"reservation_id"`
-	ShowID        int64    `json:"show_id"`
+	ReservationID int64    `json:"reservation_id,string"`
+	ShowID        int64    `json:"show_id,string"`
 	UserID        string   `json:"user_id"`
 	Seats         []string `json:"seats"`
 	AmountPaise   int64    `json:"amount_paise"`
 	Status        string   `json:"status"`
+
 }
 
 func Reserve(db *sql.DB) fiber.Handler {

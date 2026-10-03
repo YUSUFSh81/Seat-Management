@@ -80,6 +80,7 @@ func main() {
 		ReadTimeout:           10 * time.Second,
 		WriteTimeout:          30 * time.Second,
 		BodyLimit:             8 * 1024 * 1024, // POST /shows can carry tens of thousands of seats
+		Immutable:             true,
 	})
 
 	app.Get("/healthz", func(c *fiber.Ctx) error {
@@ -110,7 +111,10 @@ func main() {
 	app.Use(obs.RequestLogger()) // outermost
 	app.Use(recover.New())       // inside, so panics become errors the logger can see
 
-	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
+	app.Get("/metrics", adaptor.HTTPHandler(promhttp.HandlerFor(
+		prometheus.DefaultGatherer,
+		promhttp.HandlerOpts{ErrorHandling: promhttp.ContinueOnError, ErrorLog: obs.PromErrLog{}},
+	)))
 
 	app.Post("/shows", auth.Middleware(secret), auth.RequireAdmin(), handlers.CreateShow(db))
 	app.Post("/shows/:show_id/reserve", auth.Middleware(secret), handlers.Reserve(db))

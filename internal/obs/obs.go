@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
 	"sync"
@@ -40,6 +41,10 @@ func newID() string {
 	rand.Read(b)
 	return hex.EncodeToString(b)
 }
+
+type PromErrLog struct{}
+
+func (PromErrLog) Println(v ...interface{}) { log.Error().Msg(fmt.Sprint(v...)) }
 
 // RequestLogger: request id, one JSON log line per request, HTTP metrics.
 // Register it BEFORE recover, so a recovered panic shows up here as a 500.
