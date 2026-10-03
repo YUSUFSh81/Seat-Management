@@ -18,6 +18,7 @@ func testDB(t *testing.T) *sql.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
+	db.SetMaxOpenConns(30)
 	if err := Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}

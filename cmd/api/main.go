@@ -99,6 +99,7 @@ func main() {
 	// })
 
 	app.Post("/shows", auth.Middleware(secret), auth.RequireAdmin(), handlers.CreateShow(db))
+	app.Post("/shows/:show_id/reserve", auth.Middleware(secret), handlers.Reserve(db))
 
 	go func() {
 		log.Info().Str("port", port).Msg("listening")
