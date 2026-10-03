@@ -6,6 +6,8 @@ import (
 	"errors"
 	"math/rand"
 	"time"
+
+	"github.com/YUSUFSh81/Seat-Management/internal/obs"
 )
 
 func Cancel(ctx context.Context, db *sql.DB, userID string, reservationID int64) (alreadyCancelled bool, err error) {
@@ -17,6 +19,7 @@ func Cancel(ctx context.Context, db *sql.DB, userID string, reservationID int64)
 			return already, err
 		}
 		lastErr = err
+		obs.Retries.WithLabelValues(retryReason(err)).Inc()
 		base := time.Duration(1<<attempt) * 10 * time.Millisecond
 		select {
 		case <-time.After(base/2 + time.Duration(rand.Int63n(int64(base)))):
@@ -24,6 +27,7 @@ func Cancel(ctx context.Context, db *sql.DB, userID string, reservationID int64)
 			return false, ctx.Err()
 		}
 	}
+	obs.Retries.WithLabelValues("exhausted").Inc()
 	return false, lastErr
 }
 

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/YUSUFSh81/Seat-Management/internal/obs"
 	"github.com/go-sql-driver/mysql"
 )
 
@@ -67,8 +68,20 @@ type SeatsUnavailableError struct{ Seats []string }
 func (e *SeatsUnavailableError) Error() string        { return "seats_unavailable" }
 func (e *SeatsUnavailableError) Is(target error) bool { return target == ErrSeatsUnavailable }
 
+func retryReason(err error) string {
+	switch {
+	case errors.Is(err, errRetry):
+		return "missing_original"
+	case mysqlErrNo(err) == errDeadlock:
+		return "deadlock"
+	default:
+		return "lock_timeout"
+	}
+}
+
 func Reserve(ctx context.Context, db *sql.DB, userID string, showID int64, seats []string, idempotencyKey string, amountPaise int64, limit int) (ReservationData, bool, error) {
 	var lastErr error
+
 	for attempt := 0; attempt < 8; attempt++ {
 		data, replay, err := reserveOnce(ctx, db, userID, showID, seats, idempotencyKey, amountPaise, limit)
 
@@ -77,6 +90,7 @@ func Reserve(ctx context.Context, db *sql.DB, userID string, showID int64, seats
 		}
 
 		lastErr = err
+		obs.Retries.WithLabelValues(retryReason(err)).Inc()
 		base := time.Duration(1<<attempt) * 10 * time.Millisecond
 		sleep := base/2 + time.Duration(rand.Int63n(int64(base)))
 
@@ -86,7 +100,7 @@ func Reserve(ctx context.Context, db *sql.DB, userID string, showID int64, seats
 			return ReservationData{}, false, ctx.Err()
 		}
 	}
-
+	obs.Retries.WithLabelValues("exhausted").Inc()
 	return ReservationData{}, false, lastErr
 
 }

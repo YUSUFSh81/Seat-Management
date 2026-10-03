@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/YUSUFSh81/Seat-Management/internal/auth"
+	"github.com/YUSUFSh81/Seat-Management/internal/obs"
 	"github.com/YUSUFSh81/Seat-Management/internal/store"
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog/log"
@@ -98,6 +99,7 @@ func Reserve(db *sql.DB) fiber.Handler {
 		}
 
 		if len(cleanSeats) > showPerUserLimit {
+			obs.Decline(c, "per_user_limit")
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "exceeded per user limit"})
 		}
 
@@ -106,10 +108,13 @@ func Reserve(db *sql.DB) fiber.Handler {
 		if err != nil {
 			switch {
 			case errors.As(err, &su):
+				obs.Decline(c, "seat_taken")
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "seats unavailable", "seats": su.Seats})
 			case errors.Is(err, store.ErrOverLimit):
+				obs.Decline(c, "per_user_limit")
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "exceeded per user limit"})
 			case errors.Is(err, store.ErrIdempotencyConflict):
+				obs.Decline(c, "idempotency_conflict")
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "idempotency key conflict"})
 
 			case errors.Is(err, context.Canceled):
@@ -131,7 +136,12 @@ func Reserve(db *sql.DB) fiber.Handler {
 			Status:        reserveData.Status,
 		}
 		if replay {
+			obs.Decline(c, "idempotent_replay")
 			c.Set("Idempotent-Replay", "true")
+		} else {
+			obs.Confirmed.Inc()
+			obs.SeatsConfirmed.Add(float64(len(reserveData.Seats)))
+			c.Locals("outcome", "confirmed")
 		}
 		return c.Status(fiber.StatusCreated).JSON(res)
 	}

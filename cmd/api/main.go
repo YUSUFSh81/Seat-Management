@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/YUSUFSh81/Seat-Management/internal/auth"
+	"github.com/YUSUFSh81/Seat-Management/internal/obs"
 	"github.com/YUSUFSh81/Seat-Management/internal/store"
 	"github.com/YUSUFSh81/Seat-Management/internal/store/handlers"
 	"github.com/go-sql-driver/mysql"
@@ -19,6 +20,12 @@ import (
 	"github.com/gofiber/fiber/v2"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
+
+	"github.com/gofiber/fiber/v2/middleware/adaptor"
+	"github.com/gofiber/fiber/v2/middleware/recover"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/collectors"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 func registerTLS() error {
@@ -97,6 +104,13 @@ func main() {
 	// app.Get("/admin-check", auth.Middleware(secret), auth.RequireAdmin(), func(c *fiber.Ctx) error {
 	// 	return c.JSON(fiber.Map{"ok": true})
 	// })
+
+	prometheus.MustRegister(obs.NewSeatsCollector(db), collectors.NewDBStatsCollector(db, "seatdb"))
+
+	app.Use(obs.RequestLogger()) // outermost
+	app.Use(recover.New())       // inside, so panics become errors the logger can see
+
+	app.Get("/metrics", adaptor.HTTPHandler(promhttp.Handler()))
 
 	app.Post("/shows", auth.Middleware(secret), auth.RequireAdmin(), handlers.CreateShow(db))
 	app.Post("/shows/:show_id/reserve", auth.Middleware(secret), handlers.Reserve(db))
