@@ -40,6 +40,7 @@ var (
 	ErrIdempotencyConflict = errors.New("idempotency_key_reused")
 	ErrShowNotFound        = errors.New("show_not_found")
 	errRetry               = errors.New("retry attempt")
+	ErrReservationNotFound = errors.New("reservation_not_found")
 )
 
 func mysqlErrNo(err error) uint16 {

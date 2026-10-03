@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"regexp"
@@ -110,6 +111,10 @@ func Reserve(db *sql.DB) fiber.Handler {
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "exceeded per user limit"})
 			case errors.Is(err, store.ErrIdempotencyConflict):
 				return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "idempotency key conflict"})
+
+			case errors.Is(err, context.Canceled):
+				log.Warn().Msg("request canceled")
+				return nil
 
 			default:
 				log.Error().Err(err).Msg("failed to reserve seat")
