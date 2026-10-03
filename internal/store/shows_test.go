@@ -5,7 +5,9 @@ import (
 	"database/sql"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
+
 	_ "github.com/go-sql-driver/mysql"
 )
 
@@ -19,10 +21,24 @@ func testDB(t *testing.T) *sql.DB {
 		t.Fatal(err)
 	}
 	db.SetMaxOpenConns(30)
+	t.Cleanup(func() { db.Close() })
 	if err := Migrate(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { db.Close() })
+
+	// safety: never truncate anything except a database whose name ends in _test
+	var dbName string
+	if err := db.QueryRow("SELECT DATABASE()").Scan(&dbName); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(dbName, "_test") {
+		t.Fatalf("refusing to truncate non-test database %q", dbName)
+	}
+	for _, tbl := range []string{"show_seats", "reservations", "user_show", "shows"} {
+		if _, err := db.Exec("TRUNCATE TABLE " + tbl); err != nil {
+			t.Fatal(err)
+		}
+	}
 	return db
 }
 
