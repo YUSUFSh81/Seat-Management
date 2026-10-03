@@ -82,7 +82,7 @@ func main() {
 
 	var maxConns int
 	if err := db.QueryRow("SELECT @@max_connections").Scan(&maxConns); err == nil {
-		log.Info().Int("db_max_connections", maxConns).Int("pool_size", 30).Msg("database limits")
+		log.Info().Int("db_max_connections", maxConns).Int("pool_size", poolSize).Msg("database limits")
 	}
 
 	mctx, mcancel := context.WithTimeout(context.Background(), 60*time.Second)
