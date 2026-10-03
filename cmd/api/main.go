@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"os/signal"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -63,10 +64,21 @@ func main() {
 		log.Fatal().Err(err).Msg("failed to register TLS for mysql")
 	}
 
-	db, err := connectDB(dsn, 60*time.Second)
+	poolSize := getEnvInt("DB_MAX_CONNS", 15)
+
+	db, err := connectDB(dsn, 60*time.Second, poolSize)
 	if err != nil {
 		log.Fatal().Err(err).Msg("db connect failed")
 	}
+
+	hdb, err := sql.Open("mysql", dsn)
+	if err != nil {
+		log.Fatal().Err(err).Msg("health pool")
+	}
+	hdb.SetMaxOpenConns(1)
+	hdb.SetMaxIdleConns(1)
+	hdb.SetConnMaxLifetime(5 * time.Minute)
+	defer hdb.Close()
 
 	var maxConns int
 	if err := db.QueryRow("SELECT @@max_connections").Scan(&maxConns); err == nil {
@@ -95,8 +107,9 @@ func main() {
 	app.Get("/readyz", func(c *fiber.Ctx) error {
 		ctx, cancel := context.WithTimeout(c.UserContext(), time.Second)
 		defer cancel()
-		if err := db.PingContext(ctx); err != nil {
-			return c.Status(fiber.StatusServiceUnavailable).JSON(fiber.Map{"status": "not_ready", "dependency": "db"})
+		if err := hdb.PingContext(ctx); err != nil { // was db.PingContext
+			return c.Status(fiber.StatusServiceUnavailable).
+				JSON(fiber.Map{"status": "not_ready", "dependency": "db"})
 		}
 		return c.JSON(fiber.Map{"status": "ready"})
 	})
@@ -111,7 +124,7 @@ func main() {
 	// 	return c.JSON(fiber.Map{"ok": true})
 	// })
 
-	prometheus.MustRegister(obs.NewSeatsCollector(db), collectors.NewDBStatsCollector(db, "seatdb"))
+	prometheus.MustRegister(obs.NewSeatsCollector(hdb), collectors.NewDBStatsCollector(db, "seatdb"))
 
 	app.Use(obs.RequestLogger()) // outermost
 	app.Use(recover.New())       // inside, so panics become errors the logger can see
@@ -145,13 +158,13 @@ func main() {
 
 }
 
-func connectDB(dsn string, maxWait time.Duration) (*sql.DB, error) {
+func connectDB(dsn string, maxWait time.Duration, poolSize int) (*sql.DB, error) {
 	db, err := sql.Open("mysql", dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(30)
-	db.SetMaxIdleConns(30)
+	db.SetMaxOpenConns(poolSize)
+	db.SetMaxIdleConns(poolSize)
 	db.SetConnMaxLifetime(5 * time.Minute)
 
 	deadline := time.Now().Add(maxWait)
@@ -184,6 +197,13 @@ func mustEnv(key string) string {
 
 func getEnv(k, def string) string {
 	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
+func getEnvInt(k string, def int) int {
+	if v, err := strconv.Atoi(os.Getenv(k)); err == nil && v > 0 {
 		return v
 	}
 	return def
