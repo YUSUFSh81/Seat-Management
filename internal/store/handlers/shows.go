@@ -1,7 +1,10 @@
 package handlers
 
 import (
+	"context"
 	"database/sql"
+	"errors"
+	"strconv"
 	"strings"
 
 	"github.com/YUSUFSh81/Seat-Management/internal/store"
@@ -104,5 +107,26 @@ func CreateShow(db *sql.DB) fiber.Handler {
 		}
 
 		return c.Status(fiber.StatusCreated).JSON(response)
+	}
+}
+
+func GetShow(db *sql.DB) fiber.Handler {
+	return func(c *fiber.Ctx) error {
+		id, err := strconv.ParseInt(c.Params("id"), 10, 64)
+		if err != nil || id < 1 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid show id"})
+		}
+		s, err := store.GetShow(c.UserContext(), db, id, c.QueryBool("include_seats", true))
+		switch {
+		case err == nil:
+			return c.JSON(s)
+		case errors.Is(err, store.ErrShowNotFound):
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "show not found"})
+		case errors.Is(err, context.Canceled):
+			return nil
+		default:
+			log.Error().Err(err).Msg("get show failed")
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
+		}
 	}
 }
