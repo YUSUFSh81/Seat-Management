@@ -10,7 +10,7 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-//go:embed migrations/*.sql 
+//go:embed migrations/*.sql
 var migrationFS embed.FS
 
 func Migrate(ctx context.Context, db *sql.DB) error {

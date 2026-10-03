@@ -8,6 +8,56 @@ import (
 	"testing"
 )
 
+func mustReserve(t *testing.T, db *sql.DB, user string, showID int64, seats []string, key string, limit int) ReservationData {
+	t.Helper()
+	data, _, err := Reserve(context.Background(), db, user, showID, seats, key, int64(len(seats))*1000, limit)
+	if err != nil {
+		t.Fatalf("reserve(%s, %v) failed: %v", user, seats, err)
+	}
+	return data
+}
+
+func seatStatus(t *testing.T, db *sql.DB, showID int64, label string) string {
+	t.Helper()
+	var s string
+	if err := db.QueryRow("SELECT status FROM show_seats WHERE show_id=? AND seat_label=?", showID, label).Scan(&s); err != nil {
+		t.Fatalf("seat %s: %v", label, err)
+	}
+	return s
+}
+
+// seats_held for a user; 0 if the row was never created
+func heldOf(t *testing.T, db *sql.DB, showID int64, user string) int {
+	t.Helper()
+	var n int
+	err := db.QueryRow("SELECT seats_held FROM user_show WHERE show_id=? AND user_id=?", showID, user).Scan(&n)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func countReservations(t *testing.T, db *sql.DB, user, key string) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM reservations WHERE user_id=? AND idempotency_key=?", user, key).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func countAvailable(t *testing.T, db *sql.DB, showID int64) int {
+	t.Helper()
+	var n int
+	if err := db.QueryRow("SELECT COUNT(*) FROM show_seats WHERE show_id=? AND status='available'", showID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 func mkShow(t *testing.T, db *sql.DB, seatCount, limit int) int64 {
 	t.Helper()
 	seats := make([]string, seatCount)
@@ -174,4 +224,109 @@ func TestPartialRequest(t *testing.T) {
 
 	assertInvariant(t, db, showID)
 
+}
+
+func TestOverLimitSingleRequest(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 10, 4)
+
+	_, replayed, err := Reserve(context.Background(), db, "alice", showID,
+		[]string{"S1", "S2", "S3", "S4", "S5"}, "k1", 5000, 4)
+
+	if !errors.Is(err, ErrOverLimit) {
+		t.Fatalf("expected ErrOverLimit, got %v", err)
+	}
+	if replayed {
+		t.Fatal("a declined request is not a replay")
+	}
+	if got := countAvailable(t, db, showID); got != 10 {
+		t.Fatalf("available = %d, want 10 (nothing should change)", got)
+	}
+	if got := countReservations(t, db, "alice", "k1"); got != 0 {
+		t.Fatalf("found %d reservation rows for the declined request", got)
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 0 {
+		t.Fatalf("seats_held = %d, want 0", got)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestOverLimitCumulative(t *testing.T) {
+	db := testDB(t)
+	ctx := context.Background()
+	showID := mkShow(t, db, 10, 4)
+
+	mustReserve(t, db, "alice", showID, []string{"S1", "S2", "S3"}, "k1", 4)
+	if got := heldOf(t, db, showID, "alice"); got != 3 {
+		t.Fatalf("seats_held = %d, want 3", got)
+	}
+
+	// 3 + 2 = 5 > 4
+	_, _, err := Reserve(ctx, db, "alice", showID, []string{"S4", "S5"}, "k2", 2000, 4)
+	if !errors.Is(err, ErrOverLimit) {
+		t.Fatalf("expected ErrOverLimit, got %v", err)
+	}
+	for _, s := range []string{"S4", "S5"} {
+		if got := seatStatus(t, db, showID, s); got != "available" {
+			t.Fatalf("%s status = %q, want available", s, got)
+		}
+	}
+	if got := heldOf(t, db, showID, "alice"); got != 3 {
+		t.Fatalf("seats_held = %d after the declined request, want 3 (the increment must roll back)", got)
+	}
+	if got := countReservations(t, db, "alice", "k2"); got != 0 {
+		t.Fatalf("found %d reservation rows for the declined request", got)
+	}
+
+	// the failed attempt must not have leaked capacity: one more seat still fits
+	mustReserve(t, db, "alice", showID, []string{"S4"}, "k3", 4)
+	if got := heldOf(t, db, showID, "alice"); got != 4 {
+		t.Fatalf("seats_held = %d, want 4", got)
+	}
+
+	// and now she is at the limit
+	_, _, err = Reserve(ctx, db, "alice", showID, []string{"S6"}, "k4", 1000, 4)
+	if !errors.Is(err, ErrOverLimit) {
+		t.Fatalf("expected ErrOverLimit at the limit, got %v", err)
+	}
+	if got := seatStatus(t, db, showID, "S6"); got != "available" {
+		t.Fatalf("S6 status = %q, want available", got)
+	}
+
+	assertInvariant(t, db, showID)
+}
+
+func TestLimitIsPerUser(t *testing.T) {
+	db := testDB(t)
+	showID := mkShow(t, db, 10, 2)
+
+	mustReserve(t, db, "alice", showID, []string{"S1", "S2"}, "ka", 2)
+	mustReserve(t, db, "bob", showID, []string{"S3", "S4"}, "kb", 2) // bob has his own counter
+
+	if got := heldOf(t, db, showID, "alice"); got != 2 {
+		t.Fatalf("alice seats_held = %d, want 2", got)
+	}
+	if got := heldOf(t, db, showID, "bob"); got != 2 {
+		t.Fatalf("bob seats_held = %d, want 2", got)
+	}
+	assertInvariant(t, db, showID)
+}
+
+func TestLimitIsPerShow(t *testing.T) {
+	db := testDB(t)
+	show1 := mkShow(t, db, 10, 2)
+	show2 := mkShow(t, db, 10, 2)
+
+	// different keys on purpose: reusing one key across shows is an idempotency conflict
+	mustReserve(t, db, "alice", show1, []string{"S1", "S2"}, "k-show1", 2)
+	mustReserve(t, db, "alice", show2, []string{"S1", "S2"}, "k-show2", 2)
+
+	if got := heldOf(t, db, show1, "alice"); got != 2 {
+		t.Fatalf("show1 seats_held = %d, want 2", got)
+	}
+	if got := heldOf(t, db, show2, "alice"); got != 2 {
+		t.Fatalf("show2 seats_held = %d, want 2", got)
+	}
+	assertInvariant(t, db, show1)
+	assertInvariant(t, db, show2)
 }
