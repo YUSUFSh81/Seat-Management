@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/YUSUFSh81/Seat-Management/internal/auth"
 	"github.com/YUSUFSh81/Seat-Management/internal/obs"
@@ -29,7 +30,26 @@ type ReserveSeatRes struct {
 	Seats         []string `json:"seats"`
 	AmountPaise   int64    `json:"amount_paise"`
 	Status        string   `json:"status"`
+}
 
+type showInfo struct {
+	price int64
+	limit int
+}
+
+var showCache sync.Map // show id -> showInfo; only found shows are cached, never "not found"
+
+func loadShow(ctx context.Context, db *sql.DB, id int64) (showInfo, error) {
+	if v, ok := showCache.Load(id); ok {
+		return v.(showInfo), nil
+	}
+	var s showInfo
+	err := db.QueryRowContext(ctx, "SELECT price_paise, per_user_limit FROM shows WHERE id = ?", id).Scan(&s.price, &s.limit)
+	if err != nil {
+		return showInfo{}, err // includes sql.ErrNoRows, which the handler maps to 404
+	}
+	showCache.Store(id, s)
+	return s, nil
 }
 
 func Reserve(db *sql.DB) fiber.Handler {
@@ -85,12 +105,7 @@ func Reserve(db *sql.DB) fiber.Handler {
 			cleanSeats = append(cleanSeats, seat)
 		}
 
-		// check if show exists
-		query := "Select price_paise, per_user_limit from shows where id = ?"
-		var showPrice int64
-		var showPerUserLimit int
-
-		err = db.QueryRowContext(c.UserContext(), query, sId).Scan(&showPrice, &showPerUserLimit)
+		info, err := loadShow(c.UserContext(), db, sId)
 		if err != nil {
 			if err == sql.ErrNoRows {
 				return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "show does not exist"})
@@ -99,12 +114,12 @@ func Reserve(db *sql.DB) fiber.Handler {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "internal error"})
 		}
 
-		if len(cleanSeats) > showPerUserLimit {
+		if len(cleanSeats) > info.limit {
 			obs.Decline(c, "per_user_limit")
 			return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "exceeded per user limit"})
 		}
 
-		reserveData, replay, err := store.Reserve(c.UserContext(), db, userId, int64(sId), cleanSeats, req.IdempotencyKey, int64(len(cleanSeats))*showPrice, showPerUserLimit)
+		reserveData, replay, err := store.Reserve(c.UserContext(), db, userId, int64(sId), cleanSeats, req.IdempotencyKey, int64(len(cleanSeats))*info.price, info.limit)
 		var su *store.SeatsUnavailableError
 		if err != nil {
 			switch {

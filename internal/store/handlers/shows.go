@@ -3,9 +3,11 @@ package handlers
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/YUSUFSh81/Seat-Management/internal/store"
 	"github.com/gofiber/fiber/v2"
@@ -28,85 +30,95 @@ type CreateShowRes struct {
 }
 
 type Seat struct {
-	SeatLabel string `json:"seat_label"`
-	Status    string `json:"status"`
+	Seat   string `json:"seat"`
+	Status string `json:"status"`
+}
+
+const (
+	maxSeats           = 50000
+	maxSeatsPerRequest = 100
+	maxNameLen         = 255
+)
+
+func badRequest(c *fiber.Ctx, msg string, extra fiber.Map) error {
+	body := fiber.Map{"error": msg}
+	for k, v := range extra {
+		body[k] = v
+	}
+	return c.Status(fiber.StatusBadRequest).JSON(body)
 }
 
 func CreateShow(db *sql.DB) fiber.Handler {
 	return func(c *fiber.Ctx) error {
-		var requestBody CreateShowReq
-		if err := c.BodyParser(&requestBody); err != nil {
-			return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "invalid req body"})
+		var req CreateShowReq
+		if err := json.Unmarshal(c.Body(), &req); err != nil {
+			return badRequest(c, "invalid JSON body", nil)
+		}
+
+		name := strings.TrimSpace(req.Name)
+		if name == "" {
+			return badRequest(c, "name not provided", nil)
+		}
+		if utf8.RuneCountInString(name) > maxNameLen {
+			return badRequest(c, "name too long", fiber.Map{"max": maxNameLen})
+		}
+		if req.PricePaise <= 0 {
+			return badRequest(c, "price must be greater than 0", nil)
 		}
 
 		limit := 4
-		if requestBody.PerUserLimit != nil {
-			limit = *requestBody.PerUserLimit
+		if req.PerUserLimit != nil {
+			limit = *req.PerUserLimit
+		}
+		if limit < 1 || limit > maxSeatsPerRequest {
+			return badRequest(c, "per_user_limit out of range", fiber.Map{"min": 1, "max": maxSeatsPerRequest})
 		}
 
-		// TODO: create the show and seats in DB
-		if strings.TrimSpace(requestBody.Name) == "" {
-			return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "name not provided"})
-		}
-		if requestBody.PricePaise <= 0 {
-			return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "price must be greater than 0"})
-		}
-		const maxSeats = 50000
-
-		n := len(requestBody.Seats)
+		n := len(req.Seats)
 		if n == 0 {
-			return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "seats not provided"})
+			return badRequest(c, "seats not provided", nil)
 		}
 		if n > maxSeats {
-			return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "too many seats", "max": maxSeats, "got": n})
+			return badRequest(c, "too many seats", fiber.Map{"max": maxSeats, "got": n})
 		}
-		duplicateSeats := make(map[string]struct{}, n)
+
+		seen := make(map[string]struct{}, n)
 		cleanSeats := make([]string, 0, n)
 		seats := make([]Seat, 0, n)
-
-		for _, rawSeat := range requestBody.Seats {
-			seat := strings.TrimSpace(strings.ToUpper(rawSeat))
+		for i, raw := range req.Seats {
+			seat := strings.TrimSpace(strings.ToUpper(raw))
 			if seat == "" {
-				return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "seat cannot be empty"})
+				return badRequest(c, "empty seat label", fiber.Map{"index": i})
 			}
-			if len(seat) > 16 || strings.ContainsAny(seat, " \t\r\n") {
-				return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "invalid seat label"})
+			if !seatRe.MatchString(seat) {
+				return badRequest(c, "invalid seat label", fiber.Map{"index": i, "seat": seat})
 			}
-
-			if _, ok := duplicateSeats[seat]; ok {
-				return c.Status(fiber.ErrBadRequest.Code).JSON(fiber.Map{"error": "duplicate seats provided"})
+			if _, dup := seen[seat]; dup {
+				return badRequest(c, "duplicate seat label", fiber.Map{"seat": seat})
 			}
-			duplicateSeats[seat] = struct{}{}
-
+			seen[seat] = struct{}{}
 			cleanSeats = append(cleanSeats, seat)
-			seats = append(seats, Seat{
-				SeatLabel: seat,
-				Status:    "available",
-			})
-
+			seats = append(seats, Seat{Seat: seat, Status: "available"})
 		}
 
-		in := store.CreateShowInput{
-			Name:         requestBody.Name,
+		showID, err := store.CreateShow(c.UserContext(), db, store.CreateShowInput{
+			Name:         name,
 			Seats:        cleanSeats,
-			PricePaise:   requestBody.PricePaise,
+			PricePaise:   req.PricePaise,
 			PerUserLimit: limit,
-		}
-		showID, err := store.CreateShow(c.UserContext(), db, in)
+		})
 		if err != nil {
 			log.Error().Err(err).Msg("failed to create show")
-			return c.Status(fiber.ErrInternalServerError.Code).JSON(fiber.Map{"error": "failed to create show"})
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "failed to create show"})
 		}
 
-		response := CreateShowRes{
+		return c.Status(fiber.StatusCreated).JSON(CreateShowRes{
 			ID:         showID,
-			Name:       requestBody.Name,
-			PricePaise: requestBody.PricePaise,
+			Name:       name,
+			PricePaise: req.PricePaise,
 			TotalSeats: len(cleanSeats),
 			Seats:      seats,
-		}
-
-		return c.Status(fiber.StatusCreated).JSON(response)
+		})
 	}
 }
 

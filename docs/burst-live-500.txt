@@ -1,0 +1,71 @@
+target https://seat-management-yv11.onrender.com ready after 247ms
+created show 2 with 2000 seats
+
+declined by reason (server metrics delta): seat_taken=1003 per_user_limit=9 idempotent_replay=38 idempotency_conflict=1
+store retries (deadlock/timeout/missing_original): 0, exhausted: 0
+
+=== outcome distribution ===
+
+hot-seat storm (S1)
+  201_confirmed      1
+  409_seat_taken     499
+
+mixed stampede (500 requests, 20 hot seats)
+  201_confirmed      88
+  201_replay         19
+  409_over_limit     3
+  409_seat_taken     504
+
+per-user limit (1 user x 10 parallel)
+  201_confirmed      4
+  409_over_limit     6
+
+same key x 20 parallel
+  201_confirmed      1
+  201_replay         19
+
+same key, different seats
+  409_key_conflict   1
+
+identity and cancel
+  201_confirmed      2
+
+overall (all reserve calls)
+  201_confirmed      96
+  201_replay         38
+  409_key_conflict   1
+  409_over_limit     9
+  409_seat_taken     1003
+
+latency of reserve calls: p50=1.092s p95=8.392s p99=8.612s max=8.779s
+final state of show 2: {TotalSeats:2000 Available:1830 Held:0 Confirmed:170}
+
+=== checks ===
+[PASS] user token cannot create shows (403)                           got 403
+[PASS] reserve without token is rejected (401)                        got 401
+[PASS] hot seat: exactly one winner                                   confirmed=1 taken=499 of 500
+[PASS] stampede: no 5xx and no network errors                         5xx=0 network=0
+[PASS] idempotency: parallel same-key pairs agree                     violations=0
+[PASS] idempotency: sequential retries return the original            violations=0
+[PASS] per-user limit: at most 4 confirmed                            confirmed=4 over_limit=6
+[PASS] same key x20: one reservation, 19 replays                      confirmed=1 replays=19 distinct_ids=1
+[PASS] same key + different seats is rejected (409)                   got 409_key_conflict
+[PASS] spoofed user_id in body is ignored                             class=201_confirmed user_id="ab2d7c5c-alice-b"
+[PASS] reserve returned a reservation id                              id="1146"
+[PASS] non-owner cancel is refused (404)                              got 404
+[PASS] owner cancel succeeds (200)                                    got 200
+[PASS] repeat cancel is idempotent (200)                              got 200
+[PASS] cancelled seat can be rebooked                                 got 201_confirmed
+[PASS] invariant held during the whole burst                          35 polls, 0 violations, 0 poll errors
+[PASS] final: available + held + confirmed == total                   {TotalSeats:2000 Available:1830 Held:0 Confirmed:170} err=<nil>
+[PASS] final: confirmed seats == seats the API confirmed minus cancelled server=170 client=170
+[PASS] final: nothing stuck in held                                   held=0
+[PASS] metrics: reservations_confirmed_total == new reservations      metric=96 client=96
+[PASS] metrics: seats_confirmed_total == seats confirmed              metric=171 client=171
+[PASS] metrics: reservations_cancelled_total == cancels               metric=1 client=1
+[PASS] metrics: seats{confirmed} moved by the net confirmed seats     metric=170 client=170
+[PASS] metrics: no 5xx recorded by the server                         server 5xx delta=0
+[PASS] client saw zero 5xx and zero network errors                    5xx=0 network=0
+[PASS] every 201 carries a reservation_id                             bad bodies=0
+
+all checks passed
